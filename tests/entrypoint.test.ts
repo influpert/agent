@@ -341,6 +341,13 @@ test("secret files are copied for the agent, the _FILE variables are re-pointed,
   expect(
     (await stat(join(f.runDir, "secrets/anthropic_api_key"))).mode & 0o777,
   ).toBe(0o400);
+  // The directory itself is handed to the agent, or the 0400 copies inside a
+  // root-owned 0700 directory would be unreadable after the privilege drop.
+  expect((await stat(join(f.runDir, "secrets"))).mode & 0o777).toBe(0o700);
+  expect((await calls(f.fake, "chown")).map((c) => c.argv)).toContainEqual([
+    "agent:agent",
+    join(f.runDir, "secrets"),
+  ]);
   // gh receives the token on stdin, once, and configures git.
   expect(await Bun.file(join(f.fake.log, "gh-login-stdin")).text()).toBe(
     "ghp_sentinel\n",

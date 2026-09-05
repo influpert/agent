@@ -46,7 +46,10 @@ as_agent() { "${DROP[@]}" "$@"; }
 # 1. Firewall first: nothing below may run with unrestricted egress.
 init-firewall
 
+# The run dir must stay traversable by the agent (umask 077 above would make a
+# fresh one root-only): its files are agent-owned, the directory is root's.
 mkdir -p "$AGENT_RUN_DIR" "$AGENT_WORKSPACE"
+chmod 755 "$AGENT_RUN_DIR"
 agent_uid="$(id -u "$AGENT_USER")"
 
 # 2. Ownership. A named volume or a `docker cp`'d tree arrives root-owned; the
@@ -82,17 +85,24 @@ fi
 # $NAME_FILE variable points at the copy, and the raw $NAME is removed from
 # the environment so no descendant of the agent inherits a value.
 secrets_dir="$AGENT_RUN_DIR/secrets"
+# Agent-owned 0700: root writes the copies, only the agent can read them.
+ensure_secrets_dir() {
+  [ -d "$secrets_dir" ] && return 0
+  mkdir -p "$secrets_dir"
+  chmod 700 "$secrets_dir"
+  chown "$AGENT_USER:$AGENT_USER" "$secrets_dir"
+}
 stage_secret() {
   local name="$1" file_var="${1}_FILE" value src dest
   dest="$secrets_dir/$(printf '%s' "$name" | tr '[:upper:]' '[:lower:]')"
   value="${!name:-}"
   src="${!file_var:-}"
   if [ -n "$value" ]; then
-    mkdir -p "$secrets_dir" && chmod 700 "$secrets_dir"
+    ensure_secrets_dir
     printf '%s\n' "$value" > "$dest"
   elif [ -n "$src" ]; then
     [ -r "$src" ] || fatal "$file_var='$src' is not readable"
-    mkdir -p "$secrets_dir" && chmod 700 "$secrets_dir"
+    ensure_secrets_dir
     cp "$src" "$dest"
   else
     return 0
