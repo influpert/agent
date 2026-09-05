@@ -1,0 +1,8 @@
+# Build context: only the image sources.
+*
+!Dockerfile
+!agent-entrypoint.sh
+!init-firewall.sh
+!lib/
+!allow-domains.d/
+!claude/

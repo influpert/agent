@@ -1,0 +1,3 @@
+# Egress the Claude Code layer needs on top of allow-domains.d/base.
+api.anthropic.com   # Claude API: auth and inference
+claude.ai           # Claude Code installer manifest, DesignSync reads
