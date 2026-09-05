@@ -1,0 +1,191 @@
+#!/usr/bin/env bash
+# bin/release — tag and publish a release of the agent images.
+#
+# There is no version file to bump: the tag IS the version. ci.yml's publish job
+# runs on a "v*" tag and pushes ghcr.io/influpert/agent:{base,claude} plus the
+# :base-<tag> and :claude-<tag> pins, then creates the GitHub release from the
+# notes file. This script's job is the part a reviewer never re-checks: that the
+# version actually moves forward, that the commit being tagged is really on main,
+# that CI is green on that exact commit (publish needs check and build-smoke to
+# pass, so a red commit would tag and then publish nothing), that the notes file
+# and the CHANGELOG entry exist — read from that commit's own tree, never from
+# local disk, which can be exactly as stale as the commit resolution below
+# guards against. Then push the tag, which is what triggers the publish.
+#
+# Usage:
+#   bin/release [--dry-run] <version> [commit-sha]
+#
+#   --dry-run     run every check and report, but do not tag or push.
+#   <version>     bare semver, e.g. 0.1.0. A leading "v" is accepted and stripped —
+#                 the tag is always constructed as v<version>, because ci.yml only
+#                 publishes on "v*" and every notes file is named that way too.
+#   [commit-sha]  optional. Defaults to the live tip of origin's main branch, read
+#                 from the GitHub API rather than any local ref, so a checkout that
+#                 is behind origin can never silently tag the wrong commit. Pass
+#                 this only to deliberately pin an older commit; doing so
+#                 re-enables the ancestry check rather than trusting it blindly.
+#
+# Exits non-zero and explains which check failed. Every check runs even after one
+# fails — "the version doesn't move AND the notes are missing" is a different
+# diagnosis from either alone. Never pushes a partial tag: the push itself only
+# starts after every check has passed.
+
+set -euo pipefail
+
+REPO="influpert/agent"
+
+command -v gh >/dev/null || { echo "release: gh is required" >&2; exit 1; }
+
+dry_run=0
+if [[ "${1:-}" == "--dry-run" ]]; then
+  dry_run=1
+  shift
+fi
+
+if [[ $# -lt 1 || $# -gt 2 ]]; then
+  echo "usage: bin/release [--dry-run] <version> [commit-sha]" >&2
+  exit 1
+fi
+
+version="${1#v}"
+if [[ ! $version =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+  echo "release: '$1' is not a semver version (expected e.g. 0.1.0)" >&2
+  exit 1
+fi
+tag="v${version}"
+
+explicit_commit="${2:-}"
+if [[ -n "$explicit_commit" && ! "$explicit_commit" =~ ^[0-9a-f]{7,40}$ ]]; then
+  echo "release: '$explicit_commit' is not a commit SHA" >&2
+  exit 1
+fi
+
+root="$(git rev-parse --show-toplevel)"
+
+fail=0
+ok()  { printf '  PASS  %s\n' "$1"; }
+bad() { printf '  FAIL  %s\n' "$1"; fail=1; }
+
+# --- refuse uncommitted changes ----------------------------------------------
+if [[ -n "$(git -C "$root" status --porcelain)" ]]; then
+  echo "release: uncommitted changes in $root — commit or stash before tagging" >&2
+  exit 1
+fi
+
+# --- the local origin remote agrees with $REPO --------------------------------
+# Every check below asks the GitHub API about $REPO; the push at the end goes to
+# whatever "origin" resolves to. If those disagree — a fork, a renamed remote —
+# every check would PASS while the tag lands somewhere else entirely.
+origin_url="$(git -C "$root" remote get-url origin)"
+if [[ "$origin_url" =~ github\.com[:/]${REPO}(\.git)?$ ]]; then
+  ok "origin remote matches ${REPO}"
+else
+  echo "release: origin ($origin_url) does not match ${REPO} — refusing" >&2
+  exit 1
+fi
+
+# --- resolve the commit, live from the remote, not from any local ref --------
+if [[ -n "$explicit_commit" ]]; then
+  commit="$explicit_commit"
+else
+  commit="$(gh api "repos/${REPO}/commits/main" --jq .sha)"
+fi
+echo "tagging ${tag} at ${commit}"
+echo
+
+# Fetch before any check reads the commit's tree. Explicit HTTPS, not "origin":
+# SSH fails on a machine whose agent holds no identity even though "origin"
+# resolves; gh's credential helper makes HTTPS work wherever `gh api` does.
+git -C "$root" fetch --quiet "https://github.com/${REPO}.git" main
+
+# --- 1. version moves forward, read from the remote tag list -----------------
+# --paginate: the un-paginated call returns only the first page once the tag
+# count exceeds it, which would make "latest" wrong with no error.
+latest="$(gh api --paginate "repos/${REPO}/tags" --jq '.[].name' | sed 's/^v//' | sort -V | tail -1)"
+if [[ -z "$latest" ]]; then
+  ok "no existing tags — ${version} would be the first release"
+else
+  newest="$(printf '%s\n%s\n' "$latest" "$version" | sort -V | tail -1)"
+  if [[ "$newest" == "$version" && "$version" != "$latest" ]]; then
+    ok "${version} moves forward past latest tag v${latest}"
+  else
+    bad "${version} does not move forward past latest tag v${latest}"
+  fi
+fi
+
+# --- 2. the commit is really on main ------------------------------------------
+if [[ -z "$explicit_commit" ]]; then
+  ok "commit came from main's own tip"
+elif result="$(gh api "repos/${REPO}/compare/main...${commit}" --jq .status 2>&1)"; then
+  if [[ "$result" == "identical" || "$result" == "behind" ]]; then
+    ok "${commit} is an ancestor of main (status: ${result})"
+  else
+    bad "${commit} is NOT an ancestor of main (status: ${result})"
+  fi
+else
+  bad "${commit} could not be compared against main: ${result}"
+fi
+
+# --- 3. CI is green on that exact commit --------------------------------------
+# publish has `needs: [check, build-smoke]`; a tag on a red commit would run the
+# workflow and publish nothing, with the failure buried in a skipped job.
+for job in check build-smoke; do
+  conclusion="$(gh api "repos/${REPO}/commits/${commit}/check-runs" \
+    --jq "[.check_runs[] | select(.name == \"${job}\")] | sort_by(.completed_at) | last | .conclusion // \"none\"" 2>/dev/null || echo none)"
+  if [[ "$conclusion" == "success" ]]; then
+    ok "CI job ${job} succeeded at ${commit}"
+  else
+    bad "CI job ${job} is '${conclusion}' at ${commit} — publish needs it green"
+  fi
+done
+
+# --- 4. the notes file exists and is non-empty, read from the commit's own tree
+notes_path=".github/releases/${tag}.md"
+if [[ -n "$(git -C "$root" show "${commit}:${notes_path}" 2>/dev/null)" ]]; then
+  ok "${notes_path} exists and is non-empty at ${commit}"
+else
+  bad "${notes_path} is missing or empty at ${commit} — the publish job creates the GitHub release from it"
+fi
+
+# --- 5. CHANGELOG.md has a matching entry, same commit as check 4 -------------
+changelog_heading="## [${version}]"
+if git -C "$root" show "${commit}:CHANGELOG.md" 2>/dev/null | grep -qF "$changelog_heading"; then
+  ok "CHANGELOG.md has a \"${changelog_heading}\" entry at ${commit}"
+else
+  bad "CHANGELOG.md has no \"${changelog_heading}\" entry at ${commit}"
+fi
+
+# --- 6. the tag doesn't already exist on the remote ---------------------------
+# The plural "git/refs/tags/<name>" endpoint prefix-matches ("v0.1" also matches
+# "v0.1.0"); the singular "git/ref/tags/<name>" 404s on anything but an exact match.
+if gh api "repos/${REPO}/git/ref/tags/${tag}" >/dev/null 2>&1; then
+  bad "${tag} already exists on the remote"
+else
+  ok "${tag} does not already exist on the remote"
+fi
+
+echo
+if (( fail )); then
+  echo "release: refusing to tag — fix the failures above." >&2
+  exit 1
+fi
+
+if (( dry_run )); then
+  echo "release: dry run — every check passed, not tagging or pushing"
+  exit 0
+fi
+
+# --- tag and push ---------------------------------------------------------------
+# -d first, ignoring failure: idempotent against a leftover local tag from a
+# prior run that tagged successfully but failed to push.
+git -C "$root" tag -d "$tag" >/dev/null 2>&1 || true
+git -C "$root" tag -a "$tag" -m "$tag" "$commit"
+
+if ! git -C "$root" push origin "$tag"; then
+  echo "release: push to origin failed, retrying over HTTPS" >&2
+  git -C "$root" push "https://github.com/${REPO}.git" "$tag"
+fi
+
+echo "release: pushed ${tag} at ${commit}"
+echo "release: watch https://github.com/${REPO}/actions/workflows/ci.yml"
+echo "release: images will be ghcr.io/influpert/agent:{base,claude}-${tag}"

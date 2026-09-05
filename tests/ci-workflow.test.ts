@@ -66,7 +66,7 @@ test("publish runs only on release tags, after check and build-smoke, and pins t
   const job = (await jobs()).publish;
   expect(job?.if).toBe("startsWith(github.ref, 'refs/tags/v')");
   expect(job?.needs?.sort()).toEqual(["build-smoke", "check"]);
-  expect(job?.permissions).toEqual({ contents: "read", packages: "write" });
+  expect(job?.permissions).toEqual({ contents: "write", packages: "write" });
   const [base, claude] = builds(job as Job);
   expect(base?.id).toBe("base");
   for (const step of [base, claude]) {
@@ -99,4 +99,18 @@ test("the image name is the one the README documents", async () => {
   const readme = await Bun.file(join(import.meta.dir, "../README.md")).text();
   expect(readme).toContain("`ghcr.io/influpert/agent:base`");
   expect(readme).toContain("`ghcr.io/influpert/agent:claude`");
+});
+
+test("publish creates the GitHub release from the notes file bin/release checks for", async () => {
+  const job = (await jobs()).publish;
+  const release = job?.steps.find((s) => s.run?.includes("gh release create"));
+  expect(release?.run).toContain('test -s ".github/releases/${TAG}.md"');
+  expect(release?.run).toContain("--verify-tag");
+  expect(release?.run).toContain('--notes-file ".github/releases/${TAG}.md"');
+  const script = await Bun.file(join(import.meta.dir, "../bin/release")).text();
+  expect(script).toContain('notes_path=".github/releases/${tag}.md"');
+  expect(script).toContain('REPO="influpert/agent"');
+  for (const job of ["check", "build-smoke"]) {
+    expect(script).toContain(job);
+  }
 });

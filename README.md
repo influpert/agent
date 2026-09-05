@@ -146,3 +146,17 @@ staged from `~/.hatchward/secrets/`. The image then reads the prompt and model f
 manifest. An empty operator directory is a contract error: pre-clone the repository into
 the workspace root. Combined stdout and stderr are capped at 1 MiB by the runner, which
 is why the image is quiet by default and `json` is the default output format.
+
+## Releasing
+
+```bash
+bin/release --dry-run 0.1.0   # every check, no tag
+bin/release 0.1.0             # tag main's live tip and push; ci.yml publishes
+```
+
+The tag is the version. `bin/release` refuses unless the version moves forward past the
+newest remote tag, the commit is on `main` (the live tip by default), CI's `check` and
+`build-smoke` succeeded on that commit, `.github/releases/v<version>.md` and a matching
+`CHANGELOG.md` entry exist in that commit's tree, and the tag does not exist yet. The
+publish job then pushes `:base`, `:claude`, `:base-v<version>`, `:claude-v<version>` and
+creates the GitHub release from the notes file.
