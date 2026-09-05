@@ -85,12 +85,14 @@ fi
 # $NAME_FILE variable points at the copy, and the raw $NAME is removed from
 # the environment so no descendant of the agent inherits a value.
 secrets_dir="$AGENT_RUN_DIR/secrets"
-# Agent-owned 0700: root writes the copies, only the agent can read them.
+# Root creates the 0700 directory and writes the copies into it, then hands the
+# directory to the agent once staging is done. The order matters: this root has
+# no CAP_DAC_OVERRIDE, so it cannot create files inside a directory it does not
+# own, and the agent cannot traverse one root owns.
 ensure_secrets_dir() {
   [ -d "$secrets_dir" ] && return 0
   mkdir -p "$secrets_dir"
   chmod 700 "$secrets_dir"
-  chown "$AGENT_USER:$AGENT_USER" "$secrets_dir"
 }
 stage_secret() {
   local name="$1" file_var="${1}_FILE" value src dest
@@ -116,6 +118,7 @@ stage_secret() {
 for name in $AGENT_STAGE_VARS; do
   stage_secret "$name"
 done
+[ ! -d "$secrets_dir" ] || chown "$AGENT_USER:$AGENT_USER" "$secrets_dir"
 
 # GitHub auth: the token goes to gh on stdin and is stored in the agent's own
 # gh hosts file, so git's credential helper works without a token in env.
