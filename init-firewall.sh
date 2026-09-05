@@ -203,10 +203,11 @@ if curl -fsS --connect-timeout 4 --max-time 5 -o /dev/null https://example.com 2
 fi
 
 # Positive: an allowlisted host should be reachable; warn rather than abort on
-# a transient blip (a real failure surfaces in the agent's own run).
+# a transient blip (a real failure surfaces in the agent's own run). No -f: an
+# HTTP error such as a rate-limit 403 still proves the connection went through.
 ok=0
 for _ in 1 2 3; do
-  if curl -fsS --connect-timeout 4 --max-time 8 -o /dev/null https://api.github.com/zen 2>/dev/null; then ok=1; break; fi
+  if curl -sS --connect-timeout 4 --max-time 8 -o /dev/null https://api.github.com/ 2>/dev/null; then ok=1; break; fi
   sleep 1
 done
 [ "$ok" = 1 ] || log "WARNING — api.github.com unreachable after 3 tries; allowlist may be too tight or resolved addresses rotated"

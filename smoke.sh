@@ -62,14 +62,16 @@ printf '%s' "$out" | grep -Eq '^head=[0-9a-f]{40}$' || fail "clone: no commit ha
 contains "$out" "git_owner=agent" "workspace owned by agent"
 pass "self-clone works through the firewall"
 
-# 3. Egress: host and public internet blocked, allowlisted host reachable.
+# 3. Egress: host and public internet blocked, allowlisted host reachable. The
+# GitHub probe omits -f on purpose: unauthenticated API calls are rate-limited
+# and a 403 still proves the connection was allowed through.
 python3 -m http.server 18080 --bind 0.0.0.0 >/dev/null 2>&1 &
 listener_pid=$!
 sleep 1
 probe='
   curl -fsS --max-time 4 -o /dev/null http://host.docker.internal:18080/ && echo HOST_OPEN || echo host-blocked
   curl -fsS --max-time 4 -o /dev/null https://example.com && echo EXAMPLE_OPEN || echo example-blocked
-  curl -fsS --max-time 8 -o /dev/null https://api.github.com/zen && echo github-ok || echo GITHUB_BLOCKED'
+  curl -sS --max-time 8 -o /dev/null https://api.github.com/ && echo github-ok || echo GITHUB_BLOCKED'
 out="$(docker run --rm "${CAPS[@]}" --add-host host.docker.internal:host-gateway \
   -e AGENT_ALLOW_DOMAINS=host.docker.internal "$base" sh -c "$probe" 2>"$tmp/stderr3")"
 contains "$out" "host-blocked" "host unreachable even when allowlisted by name"
