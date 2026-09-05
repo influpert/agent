@@ -18,26 +18,34 @@ async function fixture(allowFiles: Record<string, string> = {}) {
   cleanups.push(() => rm(fake.root, { force: true, recursive: true }));
   cleanups.push(() => rm(work, { force: true, recursive: true }));
   const allowDir = join(work, "allow-domains.d");
+  const rangesDir = join(work, "allow-ranges.d");
   const runDir = join(work, "run");
   await mkdir(allowDir);
+  await mkdir(rangesDir);
   await mkdir(runDir);
   for (const [name, body] of Object.entries(allowFiles)) {
     await Bun.write(join(allowDir, name), body);
   }
   const resolvConf = join(work, "resolv.conf");
   await Bun.write(resolvConf, "search example\nnameserver 192.168.65.7\n");
-  return { fake, allowDir, runDir, resolvConf };
+  return { fake, allowDir, rangesDir, runDir, resolvConf };
 }
 
 // A bridge-attached container: one loopback and one veth.
 const BRIDGED = "1: lo: <LOOPBACK,UP>;2: eth0: <BROADCAST,UP>";
 
 function baseEnv(
-  f: { allowDir: string; runDir: string; resolvConf: string },
+  f: {
+    allowDir: string;
+    rangesDir: string;
+    runDir: string;
+    resolvConf: string;
+  },
   extra: Record<string, string> = {},
 ) {
   return {
     AGENT_ALLOW_DIR: f.allowDir,
+    AGENT_RANGES_DIR: f.rangesDir,
     AGENT_RUN_DIR: f.runDir,
     AGENT_RESOLV_CONF: f.resolvConf,
     FAKE_IP_LINKS: BRIDGED,
@@ -131,8 +139,10 @@ test("allowlist merges allow-domains.d files and AGENT_ALLOW_DOMAINS, deduplicat
       "198.41.0.4",
     ].sort(),
   );
-  const resolved = (await calls(f.fake, "getent")).map((c) => c.argv[1]).sort();
-  expect(resolved).toEqual(
+  // Each host is resolved three times so round-robin answers are unioned.
+  const resolved = (await calls(f.fake, "getent")).map((c) => c.argv[1]);
+  expect(resolved).toHaveLength(18);
+  expect([...new Set(resolved)].sort()).toEqual(
     [
       "api.anthropic.com",
       "extra.example",
@@ -387,5 +397,31 @@ test("GitHub meta ranges pass through the same non-public filter", async () => {
   expect(accepted).toEqual(["140.82.1.1", "140.82.112.0/20"].sort());
   expect(r.stderr).toContain(
     "dropping non-public range 10.0.0.0/8 from api.github.com/meta",
+  );
+});
+
+test("shipped allow-ranges.d CIDRs are permitted, filtered, and survive a failed meta fetch", async () => {
+  const f = await fixture({ base: "github.com\n" });
+  await Bun.write(
+    join(f.rangesDir, "github"),
+    "# snapshot\n140.82.112.0/20\n\n10.0.0.0/8 # must be dropped\n185.199.108.0/22\n",
+  );
+  const r = await runScript(
+    script,
+    f.fake,
+    baseEnv(f, { FAKE_GETENT_MAP: "github.com=140.82.1.1" }),
+  );
+  expect(r.code).toBe(0);
+  const accepted = acceptRules(
+    (await calls(f.fake, "iptables")).map((c) => c.argv),
+  ).sort();
+  expect(accepted).toEqual(
+    ["140.82.1.1", "140.82.112.0/20", "185.199.108.0/22"].sort(),
+  );
+  expect(r.stderr).toContain(
+    "init-firewall: WARNING — dropping non-public range 10.0.0.0/8 from github",
+  );
+  expect(r.stderr).toContain(
+    "could not fetch api.github.com/meta; relying on the shipped range snapshot",
   );
 });

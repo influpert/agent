@@ -24,6 +24,7 @@
 set -euo pipefail
 
 AGENT_ALLOW_DIR="${AGENT_ALLOW_DIR:-/etc/hatchward/allow-domains.d}"
+AGENT_RANGES_DIR="${AGENT_RANGES_DIR:-/etc/hatchward/allow-ranges.d}"
 AGENT_RUN_DIR="${AGENT_RUN_DIR:-/run/hatchward}"
 AGENT_RESOLV_CONF="${AGENT_RESOLV_CONF:-/etc/resolv.conf}"
 
@@ -111,10 +112,17 @@ non_public_v4() {
   return 1
 }
 
+# Resolve every hostname several times: round-robin records (github.com hands
+# out one of several addresses per query) would otherwise leave the address a
+# later client gets outside the rule set.
+resolve_v4_union() {
+  { resolve_v4 "$1"; resolve_v4 "$1"; resolve_v4 "$1"; } | sort -u
+}
+
 while IFS= read -r d; do
   [ -n "$d" ] || continue
   found=0
-  for ip in $(resolve_v4 "$d"); do
+  for ip in $(resolve_v4_union "$d"); do
     if non_public_v4 "$ip"; then
       log "WARNING — dropping non-public address $ip for $d"
       continue
@@ -125,10 +133,28 @@ while IFS= read -r d; do
   [ "$found" = 1 ] || log "WARNING — '$d' resolved to no public IPv4 address; it will be unreachable"
 done < "$domains_file"
 
-# GitHub's published ranges: its CDN endpoints rotate across addresses a single
-# boot-time resolution of the hostnames in the allowlist would miss. Best
-# effort — a meta failure leaves the resolved addresses in place — and filtered
-# like everything else, so the list cannot smuggle in a private range.
+# Static ranges shipped in the image (allow-ranges.d/*: one CIDR per line, '#'
+# comments). GitHub's published ranges live here as a snapshot, because the
+# live api.github.com/meta fetch below is rate-limited for unauthenticated
+# callers and CI runners hit that limit routinely. Filtered like everything
+# else, so a file cannot smuggle in a private range.
+if [ -d "$AGENT_RANGES_DIR" ]; then
+  for f in "$AGENT_RANGES_DIR"/*; do
+    [ -f "$f" ] || continue
+    while IFS= read -r cidr; do
+      [ -n "$cidr" ] || continue
+      if non_public_v4 "$cidr"; then
+        log "WARNING — dropping non-public range $cidr from $(basename "$f")"
+        continue
+      fi
+      echo "$cidr" >> "$addr_file"
+    done < <(sed -e 's/#.*//' -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' "$f" | grep -v '^$' || true)
+  done
+fi
+
+# GitHub's live published ranges, when reachable: its endpoints rotate across
+# addresses a single boot-time resolution would miss. Best effort — a failure
+# leaves the snapshot and the resolved addresses in place.
 if meta="$(curl -fsS --connect-timeout 5 --max-time 10 https://api.github.com/meta 2>/dev/null)" && [ -n "$meta" ]; then
   while IFS= read -r cidr; do
     [ -n "$cidr" ] || continue
@@ -139,7 +165,7 @@ if meta="$(curl -fsS --connect-timeout 5 --max-time 10 https://api.github.com/me
     echo "$cidr" >> "$addr_file"
   done < <(printf '%s' "$meta" | jq -r '(.web // []) + (.api // []) + (.git // []) | .[]' 2>/dev/null | grep -F '.' || true)
 else
-  log "WARNING — could not fetch api.github.com/meta; relying on resolved github.com/api.github.com addresses only"
+  log "WARNING — could not fetch api.github.com/meta; relying on the shipped range snapshot and resolved addresses"
 fi
 sort -u -o "$addr_file" "$addr_file"
 

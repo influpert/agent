@@ -49,7 +49,7 @@ RUN --mount=type=cache,target=/var/cache/apt,id=apt-cache-$TARGETARCH,sharing=lo
 # Non-root user that owns the workspace and runs the agent. The uid is a
 # contract (the runner stages secrets readable by it), hence explicit.
 RUN useradd --uid "$AGENT_UID" --user-group --create-home --shell /bin/bash agent && \
-    mkdir -p /workspace /run/hatchward /etc/hatchward/allow-domains.d /usr/local/lib/hatchward && \
+    mkdir -p /workspace /run/hatchward /etc/hatchward/allow-domains.d /etc/hatchward/allow-ranges.d /usr/local/lib/hatchward && \
     chown agent:agent /workspace
 
 # mise, for user-space toolchains. Pinned release tarball, checksum verified
@@ -84,6 +84,7 @@ COPY --chmod=755 init-firewall.sh /usr/local/bin/init-firewall
 COPY --chmod=755 agent-entrypoint.sh /usr/local/bin/agent-entrypoint
 COPY --chmod=644 lib/prompt.sh /usr/local/lib/hatchward/prompt.sh
 COPY --chmod=644 allow-domains.d/base /etc/hatchward/allow-domains.d/base
+COPY --chmod=644 allow-ranges.d/github /etc/hatchward/allow-ranges.d/github
 
 # contract=1 names the runtime contract in README.md; bump it
 # only when an env variable, path or exit code there changes meaning.

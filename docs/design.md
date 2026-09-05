@@ -61,6 +61,7 @@ agent-entrypoint.sh          root phase, then setpriv → agent → exec
 init-firewall.sh             default-DROP + allowlist
 lib/prompt.sh                prompt / model / secret resolution, firewall guard
 allow-domains.d/base         hosts every layer needs
+allow-ranges.d/github        GitHub's published CIDRs, snapshot
 smoke.sh                     real-container checks (CI and local)
 README.md                    operator contract
 claude/
@@ -117,8 +118,14 @@ Gather addresses while egress is open, then lock down. Specifically:
 - The iptables binary is chosen directly (`iptables-nft`, then `-legacy`, then
   `iptables`); no `update-alternatives` writes at runtime.
 - Allowlist = every file in `allow-domains.d/` ∪ `AGENT_ALLOW_DOMAINS` (hostnames only;
-  IP literals and CIDRs are refused). Resolved addresses in loopback, RFC 1918,
-  link-local, CGNAT or multicast ranges are dropped with a warning whatever their source.
+  IP literals and CIDRs are refused there) ∪ the CIDRs in `allow-ranges.d/*`. Each host is
+  resolved three times and the answers unioned. Resolved addresses and CIDRs in loopback,
+  RFC 1918, link-local, CGNAT, multicast, reserved, benchmark or documentation ranges are
+  dropped with a warning whatever their source.
+- GitHub's published ranges ship as a snapshot in `allow-ranges.d/github` and are refreshed
+  from `api.github.com/meta` at boot when that unauthenticated call is not rate-limited —
+  it routinely is on CI runners, and without the ranges a `git clone` can connect to a
+  github.com address the boot-time resolution never saw.
 - IPv6: fatal when a v6 default route exists and ip6tables cannot be applied; a v6
   negative canary runs when a route exists.
 - `AGENT_FIREWALL=0` writes `/run/hatchward/firewall-disabled`; a CMD that would run

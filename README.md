@@ -104,9 +104,12 @@ at the copies; the raw variables are unset before the drop.
 Default-DROP on input, output and forward, then: loopback, established traffic, port 53
 to the configured resolver, and the allowlist. The allowlist is the union of every file
 in `/etc/hatchward/allow-domains.d/` (the base list plus one file per CLI layer) and
-`AGENT_ALLOW_DOMAINS`. Hostnames are resolved once at boot; addresses in loopback, RFC
-1918, link-local, CGNAT or multicast ranges are dropped with a warning whatever their
-source. GitHub's published ranges are added so its CDN endpoints resolve. A container
+`AGENT_ALLOW_DOMAINS`. Hostnames are resolved at boot (three times each, so round-robin
+answers are unioned); addresses in loopback, RFC 1918, link-local, CGNAT, multicast or
+reserved ranges are dropped with a warning whatever their source. Static CIDRs in
+`/etc/hatchward/allow-ranges.d/*` are permitted too — the base ships a snapshot of GitHub's
+published ranges, refreshed live from `api.github.com/meta` when that call is not
+rate-limited — so GitHub's rotating addresses stay reachable. A container
 with no non-loopback interface (`--network none`) skips the firewall; one with an
 interface but no `NET_ADMIN` refuses to start.
 
@@ -119,7 +122,8 @@ that would close that.
 ## Extending: what a CLI layer supplies
 
 A layer image (`<cli>/`) builds `FROM` the base and adds exactly four
-things: `allow-domains.d/<cli>` with the hosts its CLI needs, an `ENV AGENT_STAGE_VARS`
+things: `allow-domains.d/<cli>` with the hosts its CLI needs (and, if it needs fixed
+ranges, `allow-ranges.d/<cli>`), an `ENV AGENT_STAGE_VARS`
 line naming its credential variables (keep `GH_TOKEN`), `agent-<cli>.sh` as the CMD, built
 on `/usr/local/lib/hatchward/prompt.sh` (`agent_require_firewall`, `agent_resolve_prompt`,
 `agent_resolve_model`, `agent_resolve_secret`), and whatever trust or config file its CLI
