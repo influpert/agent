@@ -130,8 +130,12 @@ fi
 # publish has `needs: [check, build-smoke]`; a tag on a red commit would run the
 # workflow and publish nothing, with the failure buried in a skipped job.
 for job in check build-smoke; do
-  conclusion="$(gh api "repos/${REPO}/commits/${commit}/check-runs" \
-    --jq "[.check_runs[] | select(.name == \"${job}\")] | sort_by(.completed_at) | last | .conclusion // \"none\"" 2>/dev/null || echo none)"
+  if conclusion="$(gh api "repos/${REPO}/commits/${commit}/check-runs" \
+    --jq "[.check_runs[] | select(.name == \"${job}\")] | sort_by(.completed_at) | last | .conclusion // \"none\"" 2>/dev/null)"; then
+    :
+  else
+    conclusion="unknown (is ${commit} on the remote?)"
+  fi
   if [[ "$conclusion" == "success" ]]; then
     ok "CI job ${job} succeeded at ${commit}"
   else
