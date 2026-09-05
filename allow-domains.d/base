@@ -1,0 +1,54 @@
+# Egress allowlist for every agent image layer. One hostname per line; '#'
+# starts a comment. CLI layers add their own file beside this one, and
+# AGENT_ALLOW_DOMAINS extends the set at runtime.
+#
+# Addresses are resolved once at boot (see init-firewall.sh). Anything that
+# resolves to a private, loopback, link-local, CGNAT or multicast address is
+# dropped regardless of being listed here.
+
+# Git hosting: clone/fetch/push, gh CLI, release assets, LFS objects
+github.com
+api.github.com
+codeload.github.com
+objects.githubusercontent.com
+raw.githubusercontent.com
+media.githubusercontent.com
+github-cloud.githubusercontent.com
+release-assets.githubusercontent.com
+
+# JavaScript
+registry.npmjs.org
+registry.yarnpkg.com
+repo.yarnpkg.com
+nodejs.org
+bun.sh
+
+# Python (mise ships precompiled builds from GitHub releases; pip uses these)
+pypi.org
+files.pythonhosted.org
+
+# Ruby
+rubygems.org
+index.rubygems.org
+cache.ruby-lang.org
+
+# Rust
+crates.io
+static.crates.io
+index.crates.io
+static.rust-lang.org
+sh.rustup.rs
+
+# Go
+proxy.golang.org
+sum.golang.org
+go.dev
+dl.google.com
+
+# Debian packages (image rebuilds only; the agent has no root at runtime)
+deb.debian.org
+security.debian.org
+
+# mise: version resolution and self-metadata
+mise.jdx.dev
+mise-versions.jdx.dev
