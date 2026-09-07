@@ -130,6 +130,17 @@ Gather addresses while egress is open, then lock down. Specifically:
   negative canary runs when a route exists.
 - `AGENT_FIREWALL=0` writes `/run/hatchward/firewall-disabled`; a CMD that would run
   `--dangerously-skip-permissions` refuses unless `AGENT_UNSAFE_NO_FIREWALL=1`.
+- **Proxy mode (contract 2, `AGENT_PROXY_URL` set):** the allowlist gather above is
+  skipped entirely — `allow-domains.d/*` and `allow-ranges.d/*` are both inert — and
+  egress is locked to exactly one destination: the proxy itself. Docker's embedded DNS
+  resolver (`127.0.0.11`) is `REJECT`ed before the loopback `ACCEPT`, so a hostname
+  lookup fails fast instead of hanging. Three canaries run before the
+  `$AGENT_RUN_DIR/proxy-mode` marker is written: `getent hosts example.com` must fail
+  (DNS is dead), a direct `curl --noproxy '*'` to an IPv4 and an IPv6 literal must both
+  fail with a connect error (no path around the proxy), and a proxied
+  `curl --proxy "$AGENT_PROXY_URL" --cacert "$AGENT_CA_FILE"` to `api.github.com` must
+  succeed within 3 tries — this one is **fatal**, not a warning, because it is the
+  agent's only egress path in this mode.
 
 ### Threat model
 
@@ -139,9 +150,25 @@ agent holds the credentials it was given and can reach every allowlisted host;
 `pypi.org`, `files.pythonhosted.org`, `rubygems.org`, `deb.debian.org`, the
 `githubusercontent.com` hosts and others sit on Fastly or Cloudflare anycast addresses
 shared with arbitrary third-party sites, and DNS is an open low-bandwidth channel.
-Addresses are resolved once at boot, so a CDN rotation can drop a host mid-run. The named
-follow-up is a hostname-aware (SNI) egress proxy, with the firewall permitting only the
-proxy.
+Addresses are resolved once at boot, so a CDN rotation can drop a host mid-run.
+
+**Contract 2 closes most of that.** With `AGENT_PROXY_URL` set, the container never
+holds the real Anthropic key or GitHub token — the runner hands it the sentinel
+`hatchward-proxy-managed` instead, and a runner-owned MITM proxy (outside this image;
+see influpert/hatchward's `internal/egressproxy`) rewrites the sentinel to the real
+credential only on requests to the handful of hosts it injects for. The image's own
+contribution is entirely defensive, not the injection itself: it trusts the runner's CA
+(so the MITM leaf verifies), routes every client through the proxy (the env vars in
+§4/README), and narrows the firewall to "the proxy and nothing else" so there is no path
+to smuggle the sentinel to a real, non-proxied endpoint. `lib/prompt.sh`'s
+`agent_require_proxy_or_secret` refuses the sentinel unless `init-firewall`'s own
+`proxy-mode` marker is present, so a caller cannot hand a CLI layer the sentinel string
+without an actual proxy in front of it. What contract 2 does **not** claim: it trusts the
+proxy's allowlist and injection rules (a bug there is out of this image's blast radius to
+prevent), and a client with its own trust store or its own non-env-driven proxy
+configuration (a JVM, Bazel, anything that ignores `HTTPS_PROXY`/`NODE_EXTRA_CA_CERTS`)
+is unsupported — its TLS handshake against the MITM leaf simply fails closed, which is
+the safe direction but not a silent success.
 
 The repository's contents are trusted as code: the CMD pre-trusts `/workspace` so the
 repository's `.claude/settings.json` hooks fire in a headless run, which also means the

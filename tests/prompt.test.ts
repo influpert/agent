@@ -192,3 +192,87 @@ test("agent_require_firewall refuses to continue when the firewall was disabled 
     "agent: WARNING — firewall disabled and AGENT_UNSAFE_NO_FIREWALL=1; the agent can reach host services",
   );
 });
+
+// --- Proxy mode (contract 2) -------------------------------------------------
+// The runner hands the container the sentinel "hatchward-proxy-managed"
+// instead of a real credential, trusting the proxy to rewrite it. That value
+// must never be accepted as a real credential unless proxy mode is actually
+// active — init-firewall's own marker file, not just an env var a caller
+// could set without a running proxy, is what proves that.
+
+const SENTINEL = "hatchward-proxy-managed";
+
+test("agent_require_proxy_or_secret accepts the sentinel only when the proxy-mode marker file exists", async () => {
+  const f = await fixture();
+  const refused = await runScript(
+    f.wrapper,
+    f.fake,
+    { AGENT_RUN_DIR: f.runDir, ANTHROPIC_API_KEY: SENTINEL },
+    { args: ["agent_require_proxy_or_secret", "ANTHROPIC_API_KEY"] },
+  );
+  expect(refused.code).toBe(2);
+  expect(refused.stdout).toBe("");
+  expect(refused.stderr).toContain(
+    `agent: ANTHROPIC_API_KEY is the proxy sentinel but proxy mode is not active (no ${join(f.runDir, "proxy-mode")} marker)`,
+  );
+
+  await Bun.write(join(f.runDir, "proxy-mode"), "");
+  const accepted = await runScript(
+    f.wrapper,
+    f.fake,
+    { AGENT_RUN_DIR: f.runDir, ANTHROPIC_API_KEY: SENTINEL },
+    { args: ["agent_require_proxy_or_secret", "ANTHROPIC_API_KEY"] },
+  );
+  expect(accepted.code).toBe(0);
+  expect(accepted.stdout).toBe(`${SENTINEL}\n`);
+});
+
+test("agent_require_proxy_or_secret passes a real (non-sentinel) credential through with no marker required", async () => {
+  const f = await fixture();
+  const r = await runScript(
+    f.wrapper,
+    f.fake,
+    { AGENT_RUN_DIR: f.runDir, ANTHROPIC_API_KEY: "sk-a-real-key" },
+    { args: ["agent_require_proxy_or_secret", "ANTHROPIC_API_KEY"] },
+  );
+  expect(r.code).toBe(0);
+  expect(r.stdout).toBe("sk-a-real-key\n");
+  expect(r.stderr).toBe("");
+});
+
+test("agent_require_proxy_or_secret resolves the _FILE form too, sentinel check included", async () => {
+  const f = await fixture();
+  const file = join(f.work, "gh-token");
+  await Bun.write(file, `${SENTINEL}\n`);
+  const refused = await runScript(
+    f.wrapper,
+    f.fake,
+    { AGENT_RUN_DIR: f.runDir, GH_TOKEN_FILE: file },
+    { args: ["agent_require_proxy_or_secret", "GH_TOKEN"] },
+  );
+  expect(refused.code).toBe(2);
+  expect(refused.stdout).toBe("");
+
+  await Bun.write(join(f.runDir, "proxy-mode"), "");
+  const accepted = await runScript(
+    f.wrapper,
+    f.fake,
+    { AGENT_RUN_DIR: f.runDir, GH_TOKEN_FILE: file },
+    { args: ["agent_require_proxy_or_secret", "GH_TOKEN"] },
+  );
+  expect(accepted.code).toBe(0);
+  expect(accepted.stdout).toBe(`${SENTINEL}\n`);
+});
+
+test("agent_require_proxy_or_secret fails like agent_resolve_secret when nothing is set", async () => {
+  const f = await fixture();
+  const r = await runScript(
+    f.wrapper,
+    f.fake,
+    { AGENT_RUN_DIR: f.runDir },
+    { args: ["agent_require_proxy_or_secret", "ANTHROPIC_API_KEY"] },
+  );
+  expect(r.code).toBe(1);
+  expect(r.stdout).toBe("");
+  expect(r.stderr).toBe("");
+});

@@ -86,9 +86,9 @@ COPY --chmod=644 lib/prompt.sh /usr/local/lib/hatchward/prompt.sh
 COPY --chmod=644 allow-domains.d/base /etc/hatchward/allow-domains.d/base
 COPY --chmod=644 allow-ranges.d/github /etc/hatchward/allow-ranges.d/github
 
-# contract=1 names the runtime contract in README.md; bump it
+# contract=2 names the runtime contract in README.md; bump it
 # only when an env variable, path or exit code there changes meaning.
-LABEL org.hatchward.agent.contract="1" \
+LABEL org.hatchward.agent.contract="2" \
       org.opencontainers.image.source="https://github.com/influpert/agent"
 
 WORKDIR /workspace

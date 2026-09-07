@@ -35,6 +35,69 @@ AGENT_STAGE_VARS="${AGENT_STAGE_VARS:-GH_TOKEN}"
 log() { echo "agent-entrypoint: $*" >&2; }
 fatal() { log "FATAL — $*"; exit 1; }
 
+# 0. Proxy mode (contract 2): AGENT_PROXY_URL routes every client through a
+# runner-owned MITM proxy instead of the domain allowlist. This must happen
+# before init-firewall — the CA has to be trusted and the client env vars
+# exported before ANYTHING (including provisioning's own git/gh calls, and
+# init-firewall's own positive canary) makes a TLS connection.
+if [ -n "${AGENT_PROXY_URL:-}" ]; then
+  AGENT_CA_TRUST_DIR="${AGENT_CA_TRUST_DIR:-/usr/local/share/ca-certificates}"
+  [ -n "${AGENT_CA_FILE:-}" ] && [ -r "$AGENT_CA_FILE" ] \
+    || fatal "AGENT_CA_FILE is required and must be readable when AGENT_PROXY_URL is set"
+  openssl x509 -noout -in "$AGENT_CA_FILE" >/dev/null 2>&1 \
+    || fatal "AGENT_CA_FILE '$AGENT_CA_FILE' is not a valid PEM certificate"
+  [ "${AGENT_FIREWALL:-1}" != "0" ] \
+    || fatal "AGENT_FIREWALL=0 is not allowed when AGENT_PROXY_URL is set"
+
+  # NO_PROXY/no_proxy must carry only loopback names: anything else would let
+  # a client bypass the proxy (and its CA-trust, and the firewall's single
+  # allowed destination) for the hosts it names.
+  loopback_only() {
+    for tok in $(printf '%s' "$1" | tr ',' ' '); do
+      case "$tok" in
+        localhost|127.0.0.1|::1) ;;
+        *) return 1 ;;
+      esac
+    done
+    return 0
+  }
+  for var in NO_PROXY no_proxy; do
+    val="${!var:-}"
+    [ -z "$val" ] || loopback_only "$val" \
+      || fatal "NO_PROXY '$val' must contain only loopback names when AGENT_PROXY_URL is set"
+  done
+
+  if [ -n "${AGENT_ALLOW_DOMAINS:-}" ]; then
+    log "WARNING — AGENT_ALLOW_DOMAINS is ignored when AGENT_PROXY_URL is set (proxy allowlist is enforced by the runner)"
+  fi
+
+  mkdir -p "$AGENT_CA_TRUST_DIR"
+  cp "$AGENT_CA_FILE" "$AGENT_CA_TRUST_DIR/hatchward-proxy.crt"
+  update-ca-certificates
+
+  export NODE_EXTRA_CA_CERTS="$AGENT_CA_FILE"
+  export SSL_CERT_FILE="$AGENT_CA_FILE"
+  export SSL_CERT_DIR="/etc/ssl/certs"
+  export CURL_CA_BUNDLE="$AGENT_CA_FILE"
+  export GIT_SSL_CAINFO="$AGENT_CA_FILE"
+  export REQUESTS_CA_BUNDLE="$AGENT_CA_FILE"
+  export PIP_CERT="$AGENT_CA_FILE"
+  export CARGO_HTTP_CAINFO="$AGENT_CA_FILE"
+  export AWS_CA_BUNDLE="$AGENT_CA_FILE"
+  export DENO_CERT="/etc/ssl/certs/ca-certificates.crt"
+  export DENO_TLS_CA_STORE="system,mozilla"
+  export UV_NATIVE_TLS="1"
+  export NODE_USE_ENV_PROXY="1"
+  export CARGO_NET_GIT_FETCH_WITH_CLI="true"
+  export HTTP_PROXY="$AGENT_PROXY_URL"
+  export HTTPS_PROXY="$AGENT_PROXY_URL"
+  export http_proxy="$AGENT_PROXY_URL"
+  export https_proxy="$AGENT_PROXY_URL"
+
+  git config --system http.proxy "$AGENT_PROXY_URL"
+  git config --system http.sslCAInfo "$AGENT_CA_FILE"
+fi
+
 # The privilege drop: the agent user with every capability removed from the
 # bounding and inheritable sets and no way to regain one. One definition, used
 # by as_agent for the provisioning steps and by the final exec.

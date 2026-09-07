@@ -26,7 +26,9 @@ docker build -f claude/Dockerfile -t agent:claude .
 ./smoke.sh agent:base agent:claude
 ```
 
-`smoke.sh` needs a Docker daemon and `python3` on the host (for a throwaway listener).
+`smoke.sh` needs a Docker daemon and `python3` on the host (for a throwaway listener and,
+in case 9, a MITM proxy standing in for the runner's), plus `openssl` for case 9's
+throwaway CA.
 
 ## What a run looks like
 
@@ -88,12 +90,49 @@ process itself. `--init` is unnecessary; `tini` is the image's entrypoint.
 | `AGENT_MAX_TURNS` | claude | `--max-turns`, default 200. |
 | `AGENT_OUTPUT_FORMAT` | claude | `json` (default, final result only), `stream-json` (adds `--verbose`), or `text`. The runner caps combined output at 1 MiB. |
 | `ANTHROPIC_API_KEY` / `CLAUDE_CODE_OAUTH_TOKEN` (+ `_FILE`) | claude | Model credential; the file form is preferred. Exported only into the exec'd `claude` process. |
+| `AGENT_PROXY_URL` | base (contract 2) | `http://user:token@host:port` of a runner-owned MITM proxy. Set: **proxy mode** — the firewall drops the domain allowlist and locks egress to this one address; `AGENT_CA_FILE` becomes required. |
+| `AGENT_CA_FILE` | base (contract 2) | PEM certificate of the proxy's CA. Required and validated (`openssl x509 -noout`) when `AGENT_PROXY_URL` is set; installed into the system trust store before anything else runs. |
+| `AGENT_CA_TRUST_DIR` | base (contract 2) | Where the CA is installed as `hatchward-proxy.crt`. Overridable for tests only; defaults to `/usr/local/share/ca-certificates`. |
 
 Exit codes: `2` is a contract error — no prompt, no credential, an empty workspace, or the
 firewall disabled without the override — always with a named line on stderr. `1` with a
-`FATAL —` line is the firewall or a validation failure in the entrypoint. Any other
-non-zero status is the failing tool's own: `git` or `gh` during provisioning (their
-message, no `FATAL` line), or, once the CMD has started, the agent CLI's.
+`FATAL —` line is the firewall or a validation failure in the entrypoint — in proxy mode
+this also covers a missing/unreadable/non-PEM `AGENT_CA_FILE`, `AGENT_FIREWALL=0`, an
+over-broad `NO_PROXY`/`no_proxy`, an unresolvable or malformed `AGENT_PROXY_URL`, and any
+of the three proxy-mode canaries failing. Any other non-zero status is the failing tool's
+own: `git` or `gh` during provisioning (their message, no `FATAL` line), or, once the CMD
+has started, the agent CLI's.
+
+## Proxy mode (contract 2)
+
+`AGENT_PROXY_URL` set replaces the domain allowlist with a single trusted egress path: a
+runner-owned MITM proxy that injects real credentials on behalf of sentinel values the
+container never resolves into secrets itself. Before `init-firewall` runs at all,
+`agent-entrypoint` validates and trusts `AGENT_CA_FILE`, then exports the same client env
+vars to every provisioning step (`git`, `gh`) and the final command:
+`NODE_EXTRA_CA_CERTS`, `SSL_CERT_FILE`, `SSL_CERT_DIR`, `CURL_CA_BUNDLE`,
+`GIT_SSL_CAINFO`, `REQUESTS_CA_BUNDLE`, `PIP_CERT`, `CARGO_HTTP_CAINFO`, `AWS_CA_BUNDLE`,
+`DENO_CERT`, `DENO_TLS_CA_STORE=system,mozilla`, `UV_NATIVE_TLS=1`,
+`NODE_USE_ENV_PROXY=1`, `CARGO_NET_GIT_FETCH_WITH_CLI=true`,
+`HTTP_PROXY`/`HTTPS_PROXY`/`http_proxy`/`https_proxy=$AGENT_PROXY_URL`; `git config
+--system http.proxy`/`http.sslCAInfo` cover clones done outside a CLI layer's own
+git invocations. `allow-domains.d/*` and `allow-ranges.d/*` are both **inert** in this
+mode — nothing in them is read — and `AGENT_ALLOW_DOMAINS` is ignored with a warning
+rather than a fatal error, since a caller migrating from contract 1 may still set it.
+
+Sentinel handling: the runner hands the container `hatchward-proxy-managed` in place of a
+real `ANTHROPIC_API_KEY`/`CLAUDE_CODE_OAUTH_TOKEN`/`GH_TOKEN`. `lib/prompt.sh`'s
+`agent_require_proxy_or_secret` (available for a CLI layer to call in place of
+`agent_resolve_secret` when it wants proxy-mode support — `claude/agent-claude.sh` does not
+yet opt in) accepts that exact value only when `init-firewall` has
+written `$AGENT_RUN_DIR/proxy-mode` — proving a real proxy lockdown actually ran — and
+refuses it (exit 2) otherwise, so a caller cannot pass the sentinel through to a real
+endpoint by accident. Per client: Claude Code and Node's global `fetch` derive
+`Proxy-Authorization: Basic` from the URL userinfo and need `NODE_USE_ENV_PROXY=1`; `gh`
+and `git` (libcurl) do the same natively; `npm` and `mise` (reqwest) likewise. **Not
+supported**: the JVM, Bazel, and anything else with its own trust store or its own
+non-env-driven proxy configuration — their TLS handshake against the proxy's leaf
+certificate fails closed rather than silently succeeding.
 
 Secrets in the container: `/run/hatchward/secrets/<name>` (`0400`, agent-owned) — copies
 made in the root phase from `$NAME` or `$NAME_FILE`. The `_FILE` variables are re-pointed

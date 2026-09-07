@@ -2,7 +2,13 @@ import { afterEach, expect, test } from "bun:test";
 import { mkdir, mkdtemp, rm, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { calls, makeFakeBin, runScript, sequence } from "./lib/fakes";
+import {
+  calls,
+  makeFakeBin,
+  makeTestCert,
+  runScript,
+  sequence,
+} from "./lib/fakes";
 
 const script = join(import.meta.dir, "../agent-entrypoint.sh");
 const cleanups: (() => Promise<void>)[] = [];
@@ -62,6 +68,7 @@ const FAKES = [
   "stat",
   "id",
   "chown",
+  "update-ca-certificates",
 ];
 
 async function fixture(options: { git?: boolean; files?: string[] } = {}) {
@@ -418,4 +425,182 @@ test("HATCHWARD_ASSIGNMENT_ACTION_SOCKET passes through to the command untouched
   expect(final?.env.HATCHWARD_ASSIGNMENT_ACTION_SOCKET).toBe(
     "/run/hatchward/actions.sock",
   );
+});
+
+// --- Proxy mode (contract 2) -------------------------------------------------
+// AGENT_PROXY_URL set: before init-firewall runs at all, the runner's CA must
+// be trusted and a set of client-specific env vars exported so every
+// downstream tool (git, gh, the final command) routes through the proxy and
+// trusts its MITM leaf. AGENT_CA_TRUST_DIR stands in for
+// /usr/local/share/ca-certificates so the test never touches the real trust
+// store.
+
+const PROXY_URL = "http://hatchward:tok3n@10.99.0.1:18080";
+
+async function proxyFixture(options: { git?: boolean } = {}) {
+  const f = await fixture(options);
+  const caFile = join(f.work, "proxy-ca.pem");
+  await makeTestCert(caFile);
+  const trustDir = join(f.work, "ca-trust");
+  await mkdir(trustDir);
+  return { ...f, caFile, trustDir };
+}
+
+function proxyEnv(
+  f: {
+    workspace: string;
+    home: string;
+    runDir: string;
+    caFile: string;
+    trustDir: string;
+  },
+  extra: Record<string, string> = {},
+) {
+  return baseEnv(f, {
+    AGENT_PROXY_URL: PROXY_URL,
+    AGENT_CA_FILE: f.caFile,
+    AGENT_CA_TRUST_DIR: f.trustDir,
+    ...extra,
+  });
+}
+
+test("proxy mode: the CA is installed before init-firewall and before the first setpriv", async () => {
+  const f = await proxyFixture({ git: true });
+  const r = await run(f, proxyEnv(f));
+  expect(r.code).toBe(0);
+  const seq = await sequence(f.fake);
+  const updateCa = seq.findIndex((s) => s.name === "update-ca-certificates");
+  const firewall = seq.findIndex((s) => s.name === "init-firewall");
+  const firstSetpriv = seq.findIndex((s) => s.name === "setpriv");
+  expect(updateCa).toBeGreaterThan(-1);
+  expect(updateCa).toBeLessThan(firewall);
+  expect(updateCa).toBeLessThan(firstSetpriv);
+  expect(await Bun.file(join(f.trustDir, "hatchward-proxy.crt")).text()).toBe(
+    await Bun.file(f.caFile).text(),
+  );
+});
+
+test("proxy mode: a missing AGENT_CA_FILE is fatal before anything runs", async () => {
+  const f = await proxyFixture({ git: true });
+  const env = proxyEnv(f);
+  delete (env as Record<string, string>).AGENT_CA_FILE;
+  const r = await run(f, env);
+  expect(r.code).toBe(1);
+  expect(r.stderr).toContain(
+    "agent-entrypoint: FATAL — AGENT_CA_FILE is required and must be readable when AGENT_PROXY_URL is set",
+  );
+  expect(await calls(f.fake, "final")).toHaveLength(0);
+  expect(await calls(f.fake, "init-firewall")).toHaveLength(0);
+});
+
+test("proxy mode: an unreadable AGENT_CA_FILE is fatal before anything runs", async () => {
+  const f = await proxyFixture({ git: true });
+  const r = await run(
+    f,
+    proxyEnv(f, { AGENT_CA_FILE: join(f.work, "does-not-exist.pem") }),
+  );
+  expect(r.code).toBe(1);
+  expect(r.stderr).toContain(
+    "agent-entrypoint: FATAL — AGENT_CA_FILE is required and must be readable when AGENT_PROXY_URL is set",
+  );
+  expect(await calls(f.fake, "final")).toHaveLength(0);
+});
+
+test("proxy mode: a non-PEM AGENT_CA_FILE is fatal before anything runs", async () => {
+  const f = await proxyFixture({ git: true });
+  const notPem = join(f.work, "not-a-cert.pem");
+  await Bun.write(notPem, "this is definitely not a certificate\n");
+  const r = await run(f, proxyEnv(f, { AGENT_CA_FILE: notPem }));
+  expect(r.code).toBe(1);
+  expect(r.stderr).toContain(
+    `agent-entrypoint: FATAL — AGENT_CA_FILE '${notPem}' is not a valid PEM certificate`,
+  );
+  expect(await calls(f.fake, "final")).toHaveLength(0);
+  expect(await calls(f.fake, "update-ca-certificates")).toHaveLength(0);
+});
+
+test("proxy mode: AGENT_FIREWALL=0 is refused", async () => {
+  const f = await proxyFixture({ git: true });
+  const r = await run(f, proxyEnv(f, { AGENT_FIREWALL: "0" }));
+  expect(r.code).toBe(1);
+  expect(r.stderr).toContain(
+    "agent-entrypoint: FATAL — AGENT_FIREWALL=0 is not allowed when AGENT_PROXY_URL is set",
+  );
+  expect(await calls(f.fake, "final")).toHaveLength(0);
+  expect(await calls(f.fake, "init-firewall")).toHaveLength(0);
+});
+
+test("proxy mode: a NO_PROXY carrying anything but loopback names is refused", async () => {
+  const f = await proxyFixture({ git: true });
+  for (const bad of ["github.com", "localhost,api.anthropic.com", "*"]) {
+    const r = await run(f, proxyEnv(f, { NO_PROXY: bad }));
+    expect(r.code).toBe(1);
+    expect(r.stderr).toContain(
+      `agent-entrypoint: FATAL — NO_PROXY '${bad}' must contain only loopback names when AGENT_PROXY_URL is set`,
+    );
+    expect(await calls(f.fake, "final")).toHaveLength(0);
+  }
+  // lower-case no_proxy is checked too.
+  const r = await run(f, proxyEnv(f, { no_proxy: "evil.example" }));
+  expect(r.code).toBe(1);
+  expect(r.stderr).toContain(
+    "agent-entrypoint: FATAL — NO_PROXY 'evil.example' must contain only loopback names when AGENT_PROXY_URL is set",
+  );
+});
+
+test("proxy mode: a loopback-only NO_PROXY is accepted", async () => {
+  const f = await proxyFixture({ git: true });
+  const r = await run(f, proxyEnv(f, { NO_PROXY: "localhost,127.0.0.1,::1" }));
+  expect(r.code).toBe(0);
+  expect(await calls(f.fake, "final")).toHaveLength(1);
+});
+
+test("proxy mode: AGENT_ALLOW_DOMAINS is ignored with a warning, not a fatal error", async () => {
+  const f = await proxyFixture({ git: true });
+  const r = await run(f, proxyEnv(f, { AGENT_ALLOW_DOMAINS: "extra.example" }));
+  expect(r.code).toBe(0);
+  expect(r.stderr).toContain(
+    "agent-entrypoint: WARNING — AGENT_ALLOW_DOMAINS is ignored when AGENT_PROXY_URL is set (proxy allowlist is enforced by the runner)",
+  );
+});
+
+test("proxy mode: the proxy env vars reach git, gh and the final command, and git is configured system-wide", async () => {
+  const f = await proxyFixture({ git: true });
+  const r = await run(f, proxyEnv(f, { GH_TOKEN: "hatchward-proxy-managed" }));
+  expect(r.code).toBe(0);
+  const expected: Record<string, string> = {
+    NODE_EXTRA_CA_CERTS: f.caFile,
+    SSL_CERT_FILE: f.caFile,
+    SSL_CERT_DIR: "/etc/ssl/certs",
+    CURL_CA_BUNDLE: f.caFile,
+    GIT_SSL_CAINFO: f.caFile,
+    REQUESTS_CA_BUNDLE: f.caFile,
+    PIP_CERT: f.caFile,
+    CARGO_HTTP_CAINFO: f.caFile,
+    AWS_CA_BUNDLE: f.caFile,
+    DENO_CERT: "/etc/ssl/certs/ca-certificates.crt",
+    DENO_TLS_CA_STORE: "system,mozilla",
+    UV_NATIVE_TLS: "1",
+    NODE_USE_ENV_PROXY: "1",
+    CARGO_NET_GIT_FETCH_WITH_CLI: "true",
+  };
+  const final = (await calls(f.fake, "final")).at(-1);
+  for (const [k, v] of Object.entries(expected)) {
+    expect(final?.env[k]).toBe(v);
+  }
+  // Every git and gh invocation during provisioning saw the full var set too —
+  // not just one representative variable each. Provisioning runs before the
+  // final command, so an implementation that exports these only right before
+  // the final exec would leave git/gh unable to reach a MITM proxy in
+  // reality; nothing checking a single variable per tool would catch that.
+  const anyGit = (await calls(f.fake, "git")).at(0);
+  const ghCall = (await calls(f.fake, "gh")).at(0);
+  for (const [k, v] of Object.entries(expected)) {
+    expect(anyGit?.env[k]).toBe(v);
+    expect(ghCall?.env[k]).toBe(v);
+  }
+  // git is configured system-wide with the proxy and its CA.
+  const gitConfigs = (await calls(f.fake, "git")).map((c) => c.argv.join(" "));
+  expect(gitConfigs).toContain(`config --system http.proxy ${PROXY_URL}`);
+  expect(gitConfigs).toContain(`config --system http.sslCAInfo ${f.caFile}`);
 });
