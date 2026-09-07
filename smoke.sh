@@ -61,10 +61,12 @@ cleanup() {
   # The entrypoint chowns a bind-mounted /workspace to its internal agent uid
   # (case 9's proxy-ws/claude-proxy-ws/mise-proxy-ws); undo that as root,
   # inside a throwaway container, before the host tries to rm -rf $tmp —
-  # otherwise the un-owned .keep files make cleanup itself fail.
+  # otherwise the un-owned .keep files make cleanup itself fail. --entrypoint
+  # bypasses tini/agent-entrypoint (which would drop to the unprivileged
+  # agent user before running our command) so this actually runs as root.
   for ws in "$tmp/proxy-ws" "$tmp/claude-proxy-ws" "$tmp/mise-proxy-ws"; do
     [ -d "$ws" ] || continue
-    docker run --rm -v "$ws":/ws "$base" chmod -R a+rwX /ws >/dev/null 2>&1 || true
+    docker run --rm --entrypoint chmod -v "$ws":/ws "$base" -R a+rwX /ws >/dev/null 2>&1 || true
   done
   rm -rf "$tmp"
   docker rm -f smoke-runner-shape >/dev/null 2>&1 || true
