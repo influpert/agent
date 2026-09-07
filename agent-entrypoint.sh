@@ -42,8 +42,9 @@ fatal() { log "FATAL — $*"; exit 1; }
 # init-firewall's own positive canary) makes a TLS connection.
 if [ -n "${AGENT_PROXY_URL:-}" ]; then
   AGENT_CA_TRUST_DIR="${AGENT_CA_TRUST_DIR:-/usr/local/share/ca-certificates}"
-  [ -n "${AGENT_CA_FILE:-}" ] && [ -r "$AGENT_CA_FILE" ] \
-    || fatal "AGENT_CA_FILE is required and must be readable when AGENT_PROXY_URL is set"
+  if [ -z "${AGENT_CA_FILE:-}" ] || [ ! -r "$AGENT_CA_FILE" ]; then
+    fatal "AGENT_CA_FILE is required and must be readable when AGENT_PROXY_URL is set"
+  fi
   openssl x509 -noout -in "$AGENT_CA_FILE" >/dev/null 2>&1 \
     || fatal "AGENT_CA_FILE '$AGENT_CA_FILE' is not a valid PEM certificate"
   [ "${AGENT_FIREWALL:-1}" != "0" ] \
