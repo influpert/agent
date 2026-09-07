@@ -89,3 +89,22 @@ agent_require_firewall() {
   echo "agent: refusing to run with --dangerously-skip-permissions while the firewall is disabled (set AGENT_UNSAFE_NO_FIREWALL=1 to override)" >&2
   return 2
 }
+
+# agent_require_proxy_or_secret NAME — like agent_resolve_secret, but the
+# proxy-mode sentinel value is accepted only when init-firewall's own
+# proxy-mode marker file is present. Without the marker, a caller-set
+# sentinel (with no proxy actually running) must not be treated as a real
+# credential, so it is refused rather than silently forwarded.
+AGENT_PROXY_SENTINEL="hatchward-proxy-managed"
+agent_require_proxy_or_secret() {
+  local name="$1" value
+  value="$(agent_resolve_secret "$name")" || return 1
+  if [ "$value" = "$AGENT_PROXY_SENTINEL" ]; then
+    local marker="$AGENT_RUN_DIR/proxy-mode"
+    if [ ! -e "$marker" ]; then
+      echo "agent: $name is the proxy sentinel but proxy mode is not active (no $marker marker)" >&2
+      return 2
+    fi
+  fi
+  printf '%s\n' "$value"
+}

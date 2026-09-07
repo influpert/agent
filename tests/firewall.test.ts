@@ -425,3 +425,267 @@ test("shipped allow-ranges.d CIDRs are permitted, filtered, and survive a failed
     "could not fetch api.github.com/meta; relying on the shipped range snapshot",
   );
 });
+
+// --- Proxy mode (contract 2) -------------------------------------------------
+// AGENT_PROXY_URL set: egress is locked to the proxy alone. No allowlist is
+// gathered (allow-domains.d and AGENT_ALLOW_DOMAINS are dead in this mode),
+// Docker's embedded DNS is rejected outright, and three canaries prove the
+// lockdown actually holds before the marker file is written.
+// agent-entrypoint installs the CA and exports AGENT_CA_FILE before this
+// script runs — the positive canary reads it from the environment, same as
+// the real boot sequence.
+
+const PROXY_URL = "http://hatchward:tok3n@10.99.0.1:18080";
+const PROXY_CA_FILE = "/run/hatchward/proxy-ca.pem";
+
+function proxyEnv(
+  f: {
+    allowDir: string;
+    rangesDir: string;
+    runDir: string;
+    resolvConf: string;
+  },
+  extra: Record<string, string> = {},
+) {
+  return baseEnv(f, {
+    AGENT_PROXY_URL: PROXY_URL,
+    AGENT_CA_FILE: PROXY_CA_FILE,
+    // A clean run: the DNS canary and both IP-literal probes must fail (no
+    // FAKE_*_OK match — nothing is reachable outside the proxy), and the
+    // proxied positive canary must succeed.
+    FAKE_CURL_PROXY_OK: "api\\.github\\.com",
+    ...extra,
+  });
+}
+
+function outputAcceptDestinations(argvs: string[][]): string[] {
+  return argvs
+    .filter(
+      (a) =>
+        a[0] === "-A" &&
+        a[1] === "OUTPUT" &&
+        a.includes("-d") &&
+        a.at(-1) === "ACCEPT",
+    )
+    .map((a) => a[a.indexOf("-d") + 1] as string);
+}
+
+test("proxy mode: the full ordered iptables rule list, exactly", async () => {
+  // A base allowlist, a shipped ranges snapshot, and AGENT_ALLOW_DOMAINS are
+  // all present and must be completely ignored: proxy mode has exactly one
+  // ACCEPT target. The ranges file mirrors the non-proxy
+  // "shipped allow-ranges.d CIDRs are permitted" fixture so a script that
+  // keys "skip gathering" only off AGENT_ALLOW_DIR/AGENT_ALLOW_DOMAINS (and
+  // forgets AGENT_RANGES_DIR) would fail this.
+  const f = await fixture({ base: "github.com\nregistry.npmjs.org\n" });
+  await Bun.write(join(f.rangesDir, "github"), "140.82.112.0/20\n");
+  const r = await runScript(
+    script,
+    f.fake,
+    proxyEnv(f, { AGENT_ALLOW_DOMAINS: "pypi.org" }),
+  );
+  expect(r.code).toBe(0);
+  const rules = (await calls(f.fake, "iptables")).map((c) => c.argv.join(" "));
+  expect(rules).toEqual([
+    "-L -n",
+    "-P INPUT ACCEPT",
+    "-P OUTPUT ACCEPT",
+    "-P FORWARD ACCEPT",
+    "-F",
+    "-A OUTPUT -p udp -d 127.0.0.11 -j REJECT",
+    "-A OUTPUT -p tcp -d 127.0.0.11 -j REJECT",
+    "-A OUTPUT -o lo -j ACCEPT",
+    "-A INPUT -i lo -j ACCEPT",
+    "-A OUTPUT -m state --state ESTABLISHED,RELATED -j ACCEPT",
+    "-A INPUT -m state --state ESTABLISHED,RELATED -j ACCEPT",
+    "-A OUTPUT -d 10.99.0.1 -p tcp --dport 18080 -j ACCEPT",
+    "-P OUTPUT DROP",
+    "-P INPUT DROP",
+    "-P FORWARD DROP",
+  ]);
+  expect((await stat(join(f.runDir, "proxy-mode"))).isFile()).toBe(true);
+  // No DNS-to-resolver rule anywhere: proxy mode has no DNS carve-out.
+  expect(rules.some((r) => r.includes("--dport 53"))).toBe(false);
+});
+
+test("proxy mode: IPv6 lockdown is unchanged from non-proxy mode", async () => {
+  const f = await fixture();
+  const r = await runScript(script, f.fake, proxyEnv(f));
+  expect(r.code).toBe(0);
+  const rules = (await calls(f.fake, "ip6tables")).map((c) => c.argv.join(" "));
+  expect(rules).toEqual([
+    "-L -n",
+    "-F",
+    "-A OUTPUT -o lo -j ACCEPT",
+    "-A INPUT -i lo -j ACCEPT",
+    "-A OUTPUT -m state --state ESTABLISHED,RELATED -j ACCEPT",
+    "-A INPUT -m state --state ESTABLISHED,RELATED -j ACCEPT",
+    "-P OUTPUT DROP",
+    "-P INPUT DROP",
+    "-P FORWARD DROP",
+  ]);
+});
+
+test("proxy mode: no domain allowlist is gathered; getent resolves only the proxy host", async () => {
+  const f = await fixture({ base: "github.com\nregistry.npmjs.org\n" });
+  const r = await runScript(
+    script,
+    f.fake,
+    proxyEnv(f, {
+      AGENT_PROXY_URL: "http://hatchward:tok3n@proxy.internal.hatchward:18080",
+      AGENT_ALLOW_DOMAINS: "pypi.org",
+      FAKE_GETENT_MAP: "proxy.internal.hatchward=10.99.0.9",
+    }),
+  );
+  expect(r.code).toBe(0);
+  const argvs = (await calls(f.fake, "iptables")).map((c) => c.argv);
+  expect(outputAcceptDestinations(argvs)).toEqual(["10.99.0.9"]);
+  // Only the proxy host is ever looked up; github.com, registry.npmjs.org and
+  // pypi.org (from the ignored allowlist sources) are never resolved.
+  const resolved = (await calls(f.fake, "getent"))
+    .filter((c) => c.argv[0] === "ahostsv4")
+    .map((c) => c.argv[1]);
+  expect(resolved).toEqual(["proxy.internal.hatchward"]);
+});
+
+test("proxy mode: an IP-literal AGENT_PROXY_URL host needs no resolution", async () => {
+  const f = await fixture();
+  const r = await runScript(script, f.fake, proxyEnv(f));
+  expect(r.code).toBe(0);
+  expect(
+    (await calls(f.fake, "getent")).filter((c) => c.argv[0] === "ahostsv4"),
+  ).toHaveLength(0);
+});
+
+test("proxy mode: an unresolvable proxy hostname is fatal", async () => {
+  const f = await fixture();
+  const r = await runScript(
+    script,
+    f.fake,
+    proxyEnv(f, {
+      AGENT_PROXY_URL: "http://hatchward:tok3n@proxy.internal.hatchward:18080",
+      FAKE_GETENT_MAP: "",
+    }),
+  );
+  expect(r.code).toBe(1);
+  expect(r.stderr).toContain(
+    "init-firewall: FATAL — could not resolve proxy host 'proxy.internal.hatchward'",
+  );
+  expect(await calls(f.fake, "iptables")).toHaveLength(0);
+});
+
+test("proxy mode: a malformed AGENT_PROXY_URL is fatal", async () => {
+  const f = await fixture();
+  const r = await runScript(
+    script,
+    f.fake,
+    proxyEnv(f, { AGENT_PROXY_URL: "not-a-url" }),
+  );
+  expect(r.code).toBe(1);
+  expect(r.stderr).toContain(
+    "init-firewall: FATAL — AGENT_PROXY_URL 'not-a-url' is not a valid proxy URL",
+  );
+});
+
+test("proxy mode: getent hosts example.com must fail; DNS still resolving is fatal", async () => {
+  const ok = await fixture();
+  const clean = await runScript(script, ok.fake, proxyEnv(ok));
+  expect(clean.code).toBe(0);
+  const dnsCanary = (await calls(ok.fake, "getent")).find(
+    (c) => c.argv[0] === "hosts" && c.argv[1] === "example.com",
+  );
+  expect(dnsCanary).toBeDefined();
+
+  const bug = await fixture();
+  const r = await runScript(
+    script,
+    bug.fake,
+    proxyEnv(bug, { FAKE_GETENT_HOSTS_OK: "example.com" }),
+  );
+  expect(r.code).toBe(1);
+  expect(r.stderr).toContain(
+    "init-firewall: FATAL — example.com resolved via DNS; proxy-mode lockdown is NOT in effect",
+  );
+  await expect(stat(join(bug.runDir, "proxy-mode"))).rejects.toThrow();
+});
+
+test("proxy mode: curl --noproxy '*' against an IPv4 literal must fail; success is fatal", async () => {
+  const ok = await fixture();
+  const clean = await runScript(script, ok.fake, proxyEnv(ok));
+  expect(clean.code).toBe(0);
+  const probe = (await calls(ok.fake, "curl")).find(
+    (c) =>
+      c.argv.includes("--noproxy") && c.argv.some((a) => a.includes("1.1.1.1")),
+  );
+  expect(probe).toBeDefined();
+  expect(probe?.argv.join(" ")).toContain("--noproxy *");
+  expect(probe?.argv.join(" ")).toContain("--connect-timeout 4");
+
+  const bug = await fixture();
+  const r = await runScript(
+    script,
+    bug.fake,
+    proxyEnv(bug, { FAKE_CURL_NOPROXY_OK: "1\\.1\\.1\\.1" }),
+  );
+  expect(r.code).toBe(1);
+  expect(r.stderr).toContain(
+    "init-firewall: FATAL — 1.1.1.1 is reachable directly; proxy-mode lockdown is NOT in effect",
+  );
+});
+
+test("proxy mode: curl --noproxy '*' against an IPv6 literal must fail; success is fatal", async () => {
+  const ok = await fixture();
+  const clean = await runScript(script, ok.fake, proxyEnv(ok));
+  expect(clean.code).toBe(0);
+  const probe = (await calls(ok.fake, "curl")).find(
+    (c) =>
+      c.argv.includes("--noproxy") &&
+      c.argv.includes("-6") &&
+      c.argv.some((a) => a.includes("2606:4700:4700::1111")),
+  );
+  expect(probe).toBeDefined();
+
+  const bug = await fixture();
+  const r = await runScript(
+    script,
+    bug.fake,
+    proxyEnv(bug, { FAKE_CURL6_NOPROXY_OK: "2606:4700:4700::1111" }),
+  );
+  expect(r.code).toBe(1);
+  expect(r.stderr).toContain(
+    "init-firewall: FATAL — [2606:4700:4700::1111] is reachable directly; proxy-mode lockdown is NOT in effect",
+  );
+});
+
+test("proxy mode: the positive canary through the proxy is fatal after 3 retries", async () => {
+  const f = await fixture();
+  const r = await runScript(
+    script,
+    f.fake,
+    proxyEnv(f, { FAKE_CURL_PROXY_OK: "" }),
+  );
+  expect(r.code).toBe(1);
+  expect(r.stderr).toContain(
+    "init-firewall: FATAL — api.github.com is unreachable through the proxy after 3 tries; proxy-mode lockdown may be too tight",
+  );
+  const proxied = (await calls(f.fake, "curl")).filter((c) =>
+    c.argv.includes("--proxy"),
+  );
+  expect(proxied).toHaveLength(3);
+  const first = proxied[0];
+  expect(first?.argv).toContain(PROXY_URL);
+  const cacertIdx = first?.argv.indexOf("--cacert") ?? -1;
+  expect(cacertIdx).toBeGreaterThan(-1);
+  expect(first?.argv[cacertIdx + 1]).toBe(PROXY_CA_FILE);
+  await expect(stat(join(f.runDir, "proxy-mode"))).rejects.toThrow();
+});
+
+test("proxy mode: a clean run tries the positive canary exactly once", async () => {
+  const f = await fixture();
+  const r = await runScript(script, f.fake, proxyEnv(f));
+  expect(r.code).toBe(0);
+  const proxied = (await calls(f.fake, "curl")).filter((c) =>
+    c.argv.includes("--proxy"),
+  );
+  expect(proxied).toHaveLength(1);
+});

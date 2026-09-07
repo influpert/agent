@@ -48,6 +48,132 @@ if ! ip -o link show | grep -v ': lo:' | grep -q .; then
   exit 0
 fi
 
+resolve_v4() {
+  getent ahostsv4 "$1" 2>/dev/null | awk '{print $1}' | sort -u || true
+}
+
+# --- Proxy mode (contract 2) --------------------------------------------------
+# AGENT_PROXY_URL set: egress is locked to the proxy alone, nothing else. No
+# allowlist is gathered — allow-domains.d and allow-ranges.d are both dead in
+# this mode — and Docker's embedded DNS resolver (127.0.0.11) is rejected
+# outright so a hostname lookup cannot leak a destination outside the proxy.
+# agent-entrypoint has already validated AGENT_CA_FILE and exported it (and
+# the client env vars) before this script runs.
+#
+# The URL is parsed and the host resolved BEFORE touching iptables at all, so
+# a malformed AGENT_PROXY_URL or an unresolvable proxy host is fatal with
+# zero firewall calls made — no half-applied ruleset to clean up.
+if [ -n "${AGENT_PROXY_URL:-}" ]; then
+  proxy_host="$(printf '%s' "$AGENT_PROXY_URL" | sed -En 's#^[a-zA-Z][a-zA-Z0-9+.-]*://([^/@]*@)?([^/:]+)(:([0-9]+))?/?$#\2#p')"
+  proxy_port="$(printf '%s' "$AGENT_PROXY_URL" | sed -En 's#^[a-zA-Z][a-zA-Z0-9+.-]*://([^/@]*@)?([^/:]+)(:([0-9]+))?/?$#\4#p')"
+  [ -n "$proxy_host" ] || fatal "AGENT_PROXY_URL '$AGENT_PROXY_URL' is not a valid proxy URL"
+  proxy_port="${proxy_port:-80}"
+
+  is_ipv4_literal() {
+    printf '%s' "$1" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$'
+  }
+
+  if is_ipv4_literal "$proxy_host"; then
+    proxy_ip="$proxy_host"
+  else
+    proxy_ip="$(resolve_v4 "$proxy_host" | head -n1)"
+    [ -n "$proxy_ip" ] || fatal "could not resolve proxy host '$proxy_host'"
+  fi
+
+  # --- iptables backend ------------------------------------------------------
+  IPT=""
+  for candidate in iptables-nft iptables-legacy iptables; do
+    if command -v "$candidate" >/dev/null 2>&1 && "$candidate" -L -n >/dev/null 2>&1; then
+      IPT="$candidate"
+      break
+    fi
+  done
+  [ -n "$IPT" ] || fatal "cannot use iptables (needs --cap-add=NET_ADMIN and a netfilter-capable kernel)"
+
+  IP6T=""
+  for candidate in ip6tables-nft ip6tables-legacy ip6tables; do
+    if command -v "$candidate" >/dev/null 2>&1 && "$candidate" -L -n >/dev/null 2>&1; then
+      IP6T="$candidate"
+      break
+    fi
+  done
+
+  for chain in INPUT OUTPUT FORWARD; do "$IPT" -P "$chain" ACCEPT; done
+  "$IPT" -F
+
+  # Docker's embedded DNS resolver: even loopback-adjacent, it must not be
+  # reachable in proxy mode, so a hostname lookup cannot bypass the proxy.
+  "$IPT" -A OUTPUT -p udp -d 127.0.0.11 -j REJECT
+  "$IPT" -A OUTPUT -p tcp -d 127.0.0.11 -j REJECT
+
+  "$IPT" -A OUTPUT -o lo -j ACCEPT
+  "$IPT" -A INPUT -i lo -j ACCEPT
+  "$IPT" -A OUTPUT -m state --state ESTABLISHED,RELATED -j ACCEPT
+  "$IPT" -A INPUT -m state --state ESTABLISHED,RELATED -j ACCEPT
+
+  # The proxy itself is the only private address ever ACCEPTed.
+  "$IPT" -A OUTPUT -d "$proxy_ip" -p tcp --dport "$proxy_port" -j ACCEPT
+
+  "$IPT" -P OUTPUT DROP
+  "$IPT" -P INPUT DROP
+  "$IPT" -P FORWARD DROP
+
+  # IPv6 lockdown is unchanged from non-proxy mode.
+  has_v6_route=0
+  if ip -6 route show default 2>/dev/null | grep -q .; then has_v6_route=1; fi
+  if [ -n "$IP6T" ]; then
+    "$IP6T" -F
+    "$IP6T" -A OUTPUT -o lo -j ACCEPT
+    "$IP6T" -A INPUT -i lo -j ACCEPT
+    "$IP6T" -A OUTPUT -m state --state ESTABLISHED,RELATED -j ACCEPT
+    "$IP6T" -A INPUT -m state --state ESTABLISHED,RELATED -j ACCEPT
+    "$IP6T" -P OUTPUT DROP
+    "$IP6T" -P INPUT DROP
+    "$IP6T" -P FORWARD DROP
+    if [ "$has_v6_route" = 1 ] && curl -6 -fsS --connect-timeout 4 --max-time 5 -o /dev/null https://example.com 2>/dev/null; then
+      fatal "example.com is reachable over IPv6; default-DROP is NOT in effect"
+    fi
+  elif [ "$has_v6_route" = 1 ]; then
+    fatal "IPv6 default route present but ip6tables is unusable"
+  else
+    log "no IPv6 route; skipping ip6tables"
+  fi
+
+  # --- Canaries: prove the lockdown actually holds before the marker is written.
+  # DNS must not resolve anything: a hostname lookup that still works means the
+  # allowlist gathering was skipped but the resolver path was not sealed.
+  if getent hosts example.com >/dev/null 2>&1; then
+    fatal "example.com resolved via DNS; proxy-mode lockdown is NOT in effect"
+  fi
+
+  # Direct IP-literal probes (bypassing DNS entirely) must also fail — both
+  # families. --noproxy '*' is required: the proxy env is already exported by
+  # this point in the real boot sequence, so a bare curl would itself route
+  # through the proxy and prove nothing about the lockdown.
+  if curl --noproxy '*' --connect-timeout 4 --max-time 5 -fsS -o /dev/null https://1.1.1.1/ 2>/dev/null; then
+    fatal "1.1.1.1 is reachable directly; proxy-mode lockdown is NOT in effect"
+  fi
+  # shellcheck disable=SC2102 # the brackets are a URL literal, not a glob range
+  if curl -6 --noproxy '*' --connect-timeout 4 --max-time 5 -fsS -o /dev/null https://[2606:4700:4700::1111]/ 2>/dev/null; then
+    fatal "[2606:4700:4700::1111] is reachable directly; proxy-mode lockdown is NOT in effect"
+  fi
+
+  # Positive: the proxy itself must actually work, trusting the runner's CA.
+  # This is fatal, not a warning — without it the agent has no egress at all.
+  ok=0
+  for _ in 1 2 3; do
+    if curl -sS --connect-timeout 4 --max-time 8 --proxy "$AGENT_PROXY_URL" --cacert "${AGENT_CA_FILE:-}" -o /dev/null https://api.github.com/ 2>/dev/null; then
+      ok=1
+      break
+    fi
+  done
+  [ "$ok" = 1 ] || fatal "api.github.com is unreachable through the proxy after 3 tries; proxy-mode lockdown may be too tight"
+
+  : > "$AGENT_RUN_DIR/proxy-mode"
+  log "proxy-mode default-DROP active — egress locked to $proxy_host:$proxy_port"
+  exit 0
+fi
+
 # --- iptables backend --------------------------------------------------------
 # Pick the binary directly rather than rewriting /etc/alternatives at runtime.
 IPT=""
@@ -94,10 +220,6 @@ done
 sort -u -o "$domains_file" "$domains_file"
 
 # --- Gather phase (egress still open): resolve to addresses -------------------
-resolve_v4() {
-  getent ahostsv4 "$1" 2>/dev/null | awk '{print $1}' | sort -u || true
-}
-
 # Non-public IPv4 ranges: loopback, RFC1918, link-local, CGNAT, multicast,
 # reserved (class E), benchmark, documentation, "this network", broadcast.
 # Matches a bare address or a CIDR (the GitHub meta list is CIDRs).

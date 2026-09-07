@@ -5,6 +5,22 @@ All notable changes to the agent images are documented here. Format follows
 [Semantic Versioning](https://semver.org/). Each entry is condensed from that version's
 `.github/releases/<tag>.md`, which the publish job turns into the GitHub release.
 
+## [0.2.0] - unreleased
+
+### Added
+- Image contract 2: proxy mode. `AGENT_PROXY_URL` (+ `AGENT_CA_FILE`) routes every
+  client — `git`, `gh`, the agent CLI, `mise`, `npm`, Node's `fetch` — through a
+  runner-owned MITM proxy instead of the domain allowlist: the firewall drops to a
+  single ACCEPT for the proxy address and rejects Docker's embedded DNS resolver
+  outright, `agent-entrypoint` trusts the proxy's CA and exports the client env vars
+  every provisioning step and the final command need, and `lib/prompt.sh` gains
+  `agent_require_proxy_or_secret`, which accepts the runner's credential sentinel only
+  when the firewall's own proxy-mode marker proves a real lockdown is in effect.
+  `allow-domains.d/*` and `allow-ranges.d/*` are inert in this mode.
+- `smoke.sh` case 9: a host-side MITM fake proxy exercises the full sentinel-to-header
+  path for both the Anthropic API-key and OAuth-token sentinels, `gh`, `git`, `mise` and
+  Node's `fetch`, alongside the proxy-mode firewall's DNS and IP-literal canaries.
+
 ## [0.1.0] - unreleased
 
 ### Added

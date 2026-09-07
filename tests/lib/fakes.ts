@@ -38,9 +38,37 @@ const BODIES: Record<string, string> = {
   // Succeeds when the URL matches the FAKE_CURL_OK extended regex (a `-6`
   // request instead matches FAKE_CURL6_OK); on api.github.com/meta it also
   // prints FAKE_CURL_META_JSON. Else exit 7.
+  //
+  // Proxy-mode canaries are distinguished by flag, not just URL, so a test can
+  // pin the *shape* of the call the script makes, not only its outcome:
+  //   --noproxy present  → a deliberately direct probe; governed by
+  //                        FAKE_CURL_NOPROXY_OK / FAKE_CURL6_NOPROXY_OK (a `-6`
+  //                        request uses the v6 variant). Defaults to failing
+  //                        (exit 7), matching a working proxy-mode lockdown;
+  //                        set the *_OK var to simulate the lockdown failing
+  //                        open, which the script must treat as fatal.
+  //   --proxy present    → the positive canary through the MITM proxy;
+  //                        governed by FAKE_CURL_PROXY_OK. Records the
+  //                        --cacert argument so a test can assert it was
+  //                        given AGENT_CA_FILE.
   curl: `
-url=""; v6=0
-for a in "$@"; do case "$a" in http://*|https://*) url="$a";; -6) v6=1;; esac; done
+url=""; v6=0; noproxy=0; proxied=0
+prev=""
+for a in "$@"; do
+  case "$a" in http://*|https://*) url="$a";; -6) v6=1;; esac
+  case "$prev" in --noproxy) noproxy=1;; --proxy) proxied=1;; esac
+  prev="$a"
+done
+if [ "$proxied" = 1 ]; then
+  ok="\${FAKE_CURL_PROXY_OK-}"
+  if [ -n "$ok" ] && printf '%s' "$url" | grep -Eq "$ok"; then exit 0; fi
+  exit 7
+fi
+if [ "$noproxy" = 1 ]; then
+  ok="\${FAKE_CURL_NOPROXY_OK-}"; [ "$v6" = 0 ] || ok="\${FAKE_CURL6_NOPROXY_OK-}"
+  if [ -n "$ok" ] && printf '%s' "$url" | grep -Eq "$ok"; then exit 0; fi
+  exit 7
+fi
 ok="\${FAKE_CURL_OK-}"; [ "$v6" = 0 ] || ok="\${FAKE_CURL6_OK-}"
 if [ -n "$ok" ] && printf '%s' "$url" | grep -Eq "$ok"; then
   case "$url" in *api.github.com/meta*) printf '%s' "\${FAKE_CURL_META_JSON-}";; esac
@@ -48,9 +76,23 @@ if [ -n "$ok" ] && printf '%s' "$url" | grep -Eq "$ok"; then
 fi
 exit 7
 `,
-  // getent ahostsv4 <host>; FAKE_GETENT_MAP="host=ip ip;host2=ip"
+  // getent ahostsv4 <host> → FAKE_GETENT_MAP="host=ip ip;host2=ip" (always
+  // exit 0, matching real getent's "printed nothing" shape when a domain
+  // resolves to nothing). getent hosts <host> is the proxy-mode DNS canary:
+  // it fails (exit 2, nothing printed) unless the host is listed in
+  // FAKE_GETENT_HOSTS_OK (comma-separated) — simulating DNS staying reachable
+  // despite the lockdown, which the script must treat as fatal.
   getent: `
-host="$2"
+sub="$1"; host="$2"
+case "$sub" in
+  hosts)
+    if printf '%s\\n' "\${FAKE_GETENT_HOSTS_OK-}" | tr ',' '\\n' | grep -qx "$host"; then
+      printf '203.0.113.5 %s\\n' "$host"
+      exit 0
+    fi
+    exit 2
+    ;;
+esac
 printf '%s\\n' "\${FAKE_GETENT_MAP-}" | tr ';' '\\n' | while IFS='=' read -r h ips; do
   if [ "$h" = "$host" ]; then
     for ip in $ips; do printf '%s STREAM %s\\n' "$ip" "$host"; done
@@ -68,7 +110,42 @@ exit 0
 `,
   iptables: `[ "\${FAKE_IPTABLES_FAIL-0}" = "1" ] && exit 1; exit 0`,
   ip6tables: `[ "\${FAKE_IP6TABLES_FAIL-0}" = "1" ] && exit 1; exit 0`,
+  // update-ca-certificates takes no meaningful args in this repo's usage; just record the call.
+  "update-ca-certificates": `exit 0`,
 };
+
+/**
+ * Writes a real, valid self-signed EC certificate (PEM) to `path` using the
+ * system `openssl` — so proxy-mode CA validation tests exercise the actual
+ * `openssl x509 -noout` check the script runs, not a stand-in for it.
+ */
+export async function makeTestCert(path: string): Promise<void> {
+  const key = `${path}.key`;
+  const proc = Bun.spawn(
+    [
+      "openssl",
+      "req",
+      "-x509",
+      "-newkey",
+      "ec",
+      "-pkeyopt",
+      "ec_paramgen_curve:prime256v1",
+      "-days",
+      "1",
+      "-nodes",
+      "-subj",
+      "/CN=hatchward-proxy-smoke",
+      "-keyout",
+      key,
+      "-out",
+      path,
+    ],
+    { stdout: "ignore", stderr: "ignore" },
+  );
+  const code = await proc.exited;
+  if (code !== 0)
+    throw new Error("openssl failed to generate a test certificate");
+}
 
 export async function makeFakeBin(
   names: string[],
