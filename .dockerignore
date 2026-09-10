@@ -7,3 +7,4 @@
 !allow-domains.d/
 !allow-ranges.d/
 !claude/
+!runtime/

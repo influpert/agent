@@ -40,6 +40,7 @@ RUN --mount=type=cache,target=/var/cache/apt,id=apt-cache-$TARGETARCH,sharing=lo
     apt-get update -qq && \
     apt-get install --no-install-recommends --no-install-suggests -y \
       git git-lfs gh jq procps tini iptables iproute2 openssl unzip \
+      python3 fuse2fs e2fsprogs fuse3 util-linux \
       build-essential pkg-config \
       libssl-dev zlib1g-dev libffi-dev libyaml-dev libreadline-dev libgmp-dev \
       libpq-dev libsqlite3-dev && \
@@ -86,9 +87,20 @@ COPY --chmod=644 lib/prompt.sh /usr/local/lib/hatchward/prompt.sh
 COPY --chmod=644 allow-domains.d/base /etc/hatchward/allow-domains.d/base
 COPY --chmod=644 allow-ranges.d/github /etc/hatchward/allow-ranges.d/github
 
-# contract=2 names the runtime contract in README.md; bump it
-# only when an env variable, path or exit code there changes meaning.
-LABEL org.hatchward.agent.contract="2" \
+COPY --chmod=644 runtime/*.py /usr/local/lib/hatchward/runtime/
+COPY --chmod=755 runtime/bootstrap.sh /usr/local/bin/hatchward-bootstrap
+COPY --chmod=755 runtime/fuse2fs.sh /usr/local/bin/hatchward-fuse2fs
+COPY --chmod=755 runtime/channel.sh /usr/local/bin/hatchward-channel
+COPY --chmod=755 runtime/import.sh /usr/local/bin/hatchward-import
+COPY --chmod=755 runtime/configure.sh /usr/local/bin/hatchward-configure
+COPY --chmod=755 runtime/run.sh /usr/local/bin/hatchward-run
+RUN useradd --uid 10002 --user-group --no-create-home --shell /usr/sbin/nologin hatchward-bridge && \
+    mkdir -p /hatchward-backing /hatchward-bounded && chmod 0700 /hatchward-backing && \
+    chmod 0755 /usr/local/lib/hatchward/runtime
+
+# contract=3 adds portable execution; the standard entrypoint is preserved.
+# See docs/portable-runtime.md for the explicit portable launch contract.
+LABEL org.hatchward.agent.contract="3" \
       org.opencontainers.image.source="https://github.com/influpert/agent"
 
 WORKDIR /workspace

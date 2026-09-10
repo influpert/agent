@@ -30,6 +30,10 @@ docker build -f claude/Dockerfile -t agent:claude .
 in case 9, a MITM proxy standing in for the runner's), plus `openssl` for case 9's
 throwaway CA.
 
+Contract-3 images add the [portable macOS/Linux runtime](docs/portable-runtime.md),
+selected explicitly by the hosted runner. The standard entrypoint documented
+below remains available for existing Linux launches.
+
 ## What a run looks like
 
 `tini` → `agent-entrypoint` (root) → `setpriv` drops to `agent` with an empty capability
