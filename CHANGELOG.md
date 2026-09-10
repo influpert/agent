@@ -5,6 +5,20 @@ All notable changes to the agent images are documented here. Format follows
 [Semantic Versioning](https://semver.org/). Each entry is condensed from that version's
 `.github/releases/<tag>.md`, which the publish job turns into the GitHub release.
 
+## [0.3.0]
+
+### Added
+- Portable image contract 3 for native macOS runners using Docker Desktop:
+  bounded Docker exec transport for model proxy and assignment actions, fixed-size
+  ext4/FUSE storage, and capability-free workloads with host-held credentials.
+- Private control-socket enforcement, immutable privileged helper paths, runtime
+  daemon supervision, and actual Docker isolation/concurrency/cleanup tests.
+
+### Changed
+- Contract-3 execution requires a matching runner and explicit image trust.
+  Workspace, home, temporary files, and runtime state share the assignment disk
+  ceiling; the Claude image needs at least 1 GiB plus repository/build capacity.
+
 ## [0.2.0] - unreleased
 
 ### Added
